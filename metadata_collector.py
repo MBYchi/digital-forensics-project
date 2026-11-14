@@ -1,24 +1,24 @@
 from __future__ import annotations
-import time
 import argparse
 import base64
+import getpass
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 try:
     import yaml
 except ImportError:
-    sys.exit("[!] PyYAML library is missing. Install it with: pip install pyyaml")
-
+    sys.exit("[!] PyYAML is missing. Install it with: pip install pyyaml")
 
 CMD_TIMEOUT = 120
 HASH_ALGOS = ("md5", "sha1", "sha256", "sha512")
@@ -28,19 +28,18 @@ LSBLK_COLS = ("NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,VENDOR,REV,TRAN,RO,RM,
               "FSVER,UUID,LABEL,PTTYPE,PARTUUID,PARTLABEL,MOUNTPOINTS")
 
 
+HASH_ALGOS = ("md5", "sha1", "sha256", "sha512")
+CHUNK = 4 * 1024 * 1024
 
-# ----------------------------------------------------------------- YAML
+
 class ReportDumper(yaml.SafeDumper):
-    """Lists are indented under their key (allows folding in an editor); no aliases."""
-
+    """Lists are indented under their key (foldable in an editor); no aliases."""
 
     def increase_indent(self, flow=False, indentless=False):
         return super().increase_indent(flow, False)
 
-
     def ignore_aliases(self, data):
         return True
-
 
 
 def _str_representer(dumper, data):
@@ -48,9 +47,7 @@ def _str_representer(dumper, data):
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
 
 
-
 ReportDumper.add_representer(str, _str_representer)
-
 
 
 def dump_yaml(obj) -> str:
@@ -62,54 +59,117 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def require_root():
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        sys.exit("[!] Root privileges required (sudo).")
 
-def tool(name):
-    return shutil.which(name)
 
-
-
-def hashes_of(data: bytes) -> dict:
+def hash_bytes(data: bytes) -> dict:
     hs = {a: hashlib.new(a) for a in HASH_ALGOS}
     for h in hs.values():
         h.update(data)
     return {a: h.hexdigest() for a, h in hs.items()}
 
 
-
-def hashes_of_file(path: Path, chunk: int = 1 << 20) -> dict:
-    hs = {a: hashlib.new(a) for a in HASH_ALGOS}
-    with open(path, "rb") as fh:
-        while block := fh.read(chunk):
-            for h in hs.values():
-                h.update(block)
-    return {a: h.hexdigest() for a, h in hs.items()}
-
-
-
-def hash_device(dev, expected_bytes, chunk: int = 4 * 1024 * 1024) -> dict:
-    """Reads the whole device once (read-only) and computes all hashes at the same time."""
-    hs = {a: hashlib.new(a) for a in HASH_ALGOS}
-    total, started, t0 = 0, now_utc(), time.monotonic()
-    with open(dev, "rb") as fh:
+def hash_file(path, chunk_size=CHUNK, limit=None):
+    """Reads a file/device once, computing all hashes at the same time. Returns (hashes, bytes)."""
+    hs, total = {a: hashlib.new(a) for a in HASH_ALGOS}, 0
+    with open(path, "rb") as f:
         while True:
-            to_read = chunk if expected_bytes is None else min(chunk, expected_bytes - total)
+            to_read = chunk_size if limit is None else min(chunk_size, limit - total)
             if to_read <= 0:
                 break
-            block = fh.read(to_read)
+            block = f.read(to_read)
             if not block:
                 break
             for h in hs.values():
                 h.update(block)
             total += len(block)
+    return {a: h.hexdigest() for a, h in hs.items()}, total
+
+
+def hash_device(dev, expected_bytes) -> dict:
+    hashes, total = hash_file(dev, limit=expected_bytes)
     return {
+        "path": str(dev),
         "scope": "entire block device as given, bytes 0 .. capacity-1 (sysfs size * 512)",
         "bytes_hashed": total, "expected_bytes": expected_bytes,
         "complete": (total == expected_bytes) if expected_bytes is not None else None,
-        "started_utc": started, "finished_utc": now_utc(),
-        "duration_s": round(time.monotonic() - t0, 2),
-        "hashes": {a: h.hexdigest() for a, h in hs.items()},
+        "hashes": hashes,
     }
 
+
+def sysfs_path(device) -> Path:
+    return Path("/sys/class/block") / Path(os.path.realpath(device)).name
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def read_int(path):
+    try:
+        return int(read_text(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def device_size(dev):
+    sectors = read_int(sysfs_path(dev) / "size")
+    return sectors * 512 if sectors is not None else None
+
+
+def is_read_only(dev):
+    """sysfs ro flag. None = not applicable / unknown."""
+    v = read_int(sysfs_path(dev) / "ro")
+    return None if v is None else v == 1
+
+
+def script_info() -> dict:
+    h = hash_file(__file__)[0]
+    return {"name": Path(__file__).name, **h}
+
+
+def workstation_info() -> dict:
+    u = platform.uname()
+    return {"hostname": u.node, "user": getpass.getuser(),
+            "os": platform.platform(), "kernel": f"{u.release} {u.version}",
+            "machine": u.machine, "python": platform.python_version(),
+            "script": script_info()}
+
+
+def write_hashes_txt(path: Path):
+    """Writes <file>.hashes.txt; returns (hashes_path, hashes)."""
+    fh, _ = hash_file(path)
+    hpath = path.with_name(path.name + ".hashes.txt")
+    hpath.write_text("".join(f"{a.upper()} ({path.name}) = {fh[a]}\n" for a in HASH_ALGOS),
+                     encoding="utf-8")
+    return hpath, fh
+
+
+def write_report(path: Path, report: dict):
+    """Atomic YAML write + .hashes.txt. Returns (hashes_path, hashes)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(dump_yaml(report), encoding="utf-8")
+    tmp.replace(path)
+    return write_hashes_txt(path)
+
+
+def finish_case(report: dict, status: str, t0: float):
+    report["case"]["finished_utc"] = now_utc()
+    report["case"]["duration_s"] = round(time.monotonic() - t0, 2)
+    report["case"]["status"] = status
+
+
+def print_summary(status, files: dict, hashes: dict):
+    print(f"\n[{'+' if status == 'COMPLETED' else '!'}] Status: {status}")
+    for label, p in files.items():
+        print(f"    {label:<7}: {p}")
+    for a in HASH_ALGOS:
+        print(f"    {a.upper():<7}: {hashes[a]}")
 
 
 def encode_bytes(data: bytes) -> dict:
@@ -123,12 +183,8 @@ def encode_bytes(data: bytes) -> dict:
                 "data": base64.b64encode(chunk).decode("ascii")}
 
 
-
-def decode_text(d: dict) -> bytes:
-    if d["encoding"] == "base64":
-        return base64.b64decode(d["data"])
-    return "\n".join(d["lines"]).encode("utf-8")
-
+def tool(name):
+    return shutil.which(name)
 
 
 def try_cmd(cmd):
@@ -137,29 +193,6 @@ def try_cmd(cmd):
         return p.returncode, (p.stdout or p.stderr).decode(errors="replace").strip()
     except Exception:  # noqa: BLE001
         return None, ""
-
-
-
-def sysfs_path(device):
-    return Path("/sys/class/block") / Path(device).name
-
-
-
-def read_text(path):
-    try:
-        return path.read_text().strip()
-    except Exception:  # noqa: BLE001
-        return None
-
-
-
-def read_int(path):
-    t = read_text(path)
-    try:
-        return int(t)
-    except (TypeError, ValueError):
-        return None
-
 
 
 def base_disk_of(device):
@@ -175,14 +208,12 @@ def base_disk_of(device):
     return name
 
 
-
 def list_partitions(base):
     try:
         return sorted(p.name for p in sysfs_path(base).iterdir()
                       if p.is_dir() and re.match(rf"^{re.escape(base)}(p?\d+)$", p.name))
     except Exception:  # noqa: BLE001
         return []
-
 
 
 def read_at(device, offset, length):
@@ -192,7 +223,6 @@ def read_at(device, offset, length):
             return fh.read(length)
     except Exception:  # noqa: BLE001
         return b""
-
 
 
 def hexdump_lines(data: bytes) -> list:
@@ -205,14 +235,12 @@ def hexdump_lines(data: bytes) -> list:
     return out
 
 
-
 def blob(data: bytes, with_hexdump=True) -> dict:
-    d = {"bytes": len(data), "hashes": hashes_of(data),
+    d = {"bytes": len(data), "hashes": hash_bytes(data),
          "base64": base64.b64encode(data).decode("ascii")}
     if with_hexdump:
         d["hexdump"] = hexdump_lines(data)
     return d
-
 
 
 def udev_unescape(s: str) -> str:
@@ -227,7 +255,6 @@ def udev_unescape(s: str) -> str:
     return bytes(out).decode("utf-8", errors="backslashreplace").strip()
 
 
-
 def parse_kv(text):
     out = {}
     for ln in text.splitlines():
@@ -238,9 +265,7 @@ def parse_kv(text):
     return out
 
 
-
 def parse_generic(text):
-    """Any text: 'key: value' -> fields; the rest -> other_lines (nothing is lost)."""
     fields, other = {}, []
     for ln in text.splitlines():
         if not ln.strip():
@@ -263,7 +288,6 @@ def parse_generic(text):
     return out
 
 
-
 def parse_blkid(text):
     res = []
     for ln in text.splitlines():
@@ -274,10 +298,8 @@ def parse_blkid(text):
     return res
 
 
-
 _UDEV_MATCH = {"KERNEL": "kernel", "KERNELS": "kernel", "SUBSYSTEM": "subsystem",
                "SUBSYSTEMS": "subsystem", "DRIVER": "driver", "DRIVERS": "driver"}
-
 
 
 def parse_udev_attrs(text):
@@ -299,7 +321,6 @@ def parse_udev_attrs(text):
         if m:
             cur["match"][_UDEV_MATCH[m.group(1)]] = m.group(2)
     return devs
-
 
 
 def parse_fdisk(text):
@@ -329,7 +350,6 @@ def parse_fdisk(text):
     return d
 
 
-
 def parse_sgdisk(text):
     d = {"disk": {}, "partitions": [], "messages": []}
     for ln in text.splitlines():
@@ -354,7 +374,6 @@ def parse_sgdisk(text):
     return d
 
 
-
 def parse_file_s(text):
     t = text.strip()
     m = re.match(r"^(\S+):\s+(.*)$", t, re.S)
@@ -372,7 +391,6 @@ def parse_file_s(text):
     return d
 
 
-
 def parse_mmls(text):
     d = {"fields": {}, "slots": []}
     for ln in text.splitlines():
@@ -387,10 +405,8 @@ def parse_mmls(text):
     return d
 
 
-
 def parse_mmstat(text):
     return {"volume_system": text.strip()}
-
 
 
 def parse_hdparm_n(text):
@@ -399,10 +415,8 @@ def parse_hdparm_n(text):
              "hpa_reported": m.group(3)} if m else None)
 
 
-
 def parse_json(text):
     return json.loads(text)
-
 
 
 STAT_FIELDS = [
@@ -412,7 +426,6 @@ STAT_FIELDS = [
     "discard_ios", "discard_merges", "discard_sectors", "discard_ticks_ms",
     "flush_ios", "flush_ticks_ms",
 ]
-
 
 
 def parse_stat(text):
@@ -425,7 +438,6 @@ def parse_stat(text):
         d["write_bytes"] = d["write_sectors"] * 512
         d["no_writes_seen"] = d["write_ios"] == 0 and d["write_sectors"] == 0
     return d
-
 
 
 def parse_ntfs_boot(sec: bytes, partition_byte_offset: int = 0) -> dict:
@@ -460,17 +472,14 @@ def parse_ntfs_boot(sec: bytes, partition_byte_offset: int = 0) -> dict:
     }
 
 
-
 PARSERS = {"udev_properties": parse_kv, "udev_attributes": parse_udev_attrs,
            "fdisk": parse_fdisk, "sgdisk": parse_sgdisk, "file_s": parse_file_s,
            "mmls": parse_mmls, "mmstat": parse_mmstat, "hpa_check": parse_hdparm_n,
            "smart_json": parse_json}
 
 
-
 def parser_for(art_id):
     return parse_blkid if art_id.startswith("blkid_") else PARSERS.get(art_id, parse_generic)
-
 
 
 FS_SIGNATURES = [
@@ -498,7 +507,6 @@ MBR_TYPES = {
 }
 
 
-
 def scan_fs_signatures(data):
     found = []
     for name, off, magic, osys, note in FS_SIGNATURES:
@@ -510,7 +518,6 @@ def scan_fs_signatures(data):
                       "os": "BSD/illumos (OpenZFS)",
                       "note": "vdev labels at the start and end of the disk"})
     return found
-
 
 
 def parse_mbr(sector0: bytes, ss: int = 512) -> dict:
@@ -533,10 +540,8 @@ def parse_mbr(sector0: bytes, ss: int = 512) -> dict:
     return {"signature_valid": True, "partitions": parts, "disk_signature": f"0x{sig:08x}"}
 
 
-
 def fmt_guid(raw):
     return str(uuid.UUID(bytes_le=raw)) if len(raw) == 16 else "?"
-
 
 
 def parse_gpt(dev, ss: int = 512) -> dict:
@@ -566,7 +571,6 @@ def parse_gpt(dev, ss: int = 512) -> dict:
     return out
 
 
-
 class Session:
     def __init__(self, device, base, case_dir: Path, evidence_id, examiner):
         self.device, self.base = device, base
@@ -574,6 +578,7 @@ class Session:
         self.out_dir = case_dir / "metadata"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.evidence_id = evidence_id
+        self.t0 = time.monotonic()
         self.doc = {
             "case": {"evidence_id": evidence_id, "examiner": examiner,
                      "device": device, "base_disk": self.dev_base,
@@ -611,7 +616,7 @@ class Session:
             if p.stderr.strip():
                 art["stderr_lines"] = p.stderr.decode("utf-8", errors="replace").rstrip("\n").split("\n")
             if KEEP_RAW:
-                art["raw"] = {"stdout": {"bytes": len(p.stdout), "hashes": hashes_of(p.stdout),
+                art["raw"] = {"stdout": {"bytes": len(p.stdout), "hashes": hash_bytes(p.stdout),
                                           **encode_bytes(p.stdout)}}
         except subprocess.TimeoutExpired:
             art["error"] = "timeout"
@@ -637,20 +642,10 @@ class Session:
 
 
     def finish(self, status):
-        d = self.doc
-        d["case"]["finished_utc"] = now_utc()
-        d["case"]["status"] = status
-        name = f"{self.evidence_id}_{self.base}.yaml"
-        path = self.out_dir / name
-        tmp = path.with_name(name + ".tmp")
-        tmp.write_text(dump_yaml(d), encoding="utf-8")
-        tmp.replace(path)
-        fh = hashes_of_file(path)
-        hpath = path.with_name(name + ".hashes.txt")
-        hpath.write_text("".join(f"{a.upper()} ({name}) = {fh[a]}\n" for a in HASH_ALGOS),
-                         encoding="utf-8")
+        finish_case(self.doc, status, self.t0)
+        path = self.out_dir / f"{self.evidence_id}_{self.base}.yaml"
+        hpath, fh = write_report(path, self.doc)
         return path, hpath, fh
-
 
 
 def verify_read_only(s: Session) -> bool:
@@ -680,14 +675,12 @@ def verify_read_only(s: Session) -> bool:
     return ok
 
 
-
 TOOLS = [("smartctl", ["smartctl", "--version"]), ("hdparm", ["hdparm", "-V"]),
          ("nvme", ["nvme", "version"]), ("fdisk", ["fdisk", "--version"]),
          ("sgdisk", ["sgdisk", "--version"]), ("blkid", ["blkid", "--version"]),
          ("file", ["file", "--version"]), ("mmls", ["mmls", "-V"]),
          ("fsstat", ["fsstat", "-V"]), ("blockdev", ["blockdev", "--version"]),
          ("udevadm", ["udevadm", "--version"]), ("lsblk", ["lsblk", "--version"])]
-
 
 
 def assess_hpa(s: Session, size_sectors):
@@ -715,7 +708,6 @@ def assess_hpa(s: Session, size_sectors):
     return hpa
 
 
-
 def collect(device, case_dir, evidence_id, examiner):
     base = base_disk_of(device)
     s = Session(device, base, case_dir, evidence_id, examiner)
@@ -723,7 +715,6 @@ def collect(device, case_dir, evidence_id, examiner):
     print(f"[i] Media: {device} (base disk: {dev})")
 
 
-    u = os.uname()
     versions = {}
     for name, vcmd in TOOLS:
         if tool(name):
@@ -732,14 +723,8 @@ def collect(device, case_dir, evidence_id, examiner):
         else:
             versions[name] = None
             s.warn(f"tool unavailable: {name}")
-    s.doc["workstation"] = {
-        "hostname": u.nodename, "kernel": f"{u.release} {u.version}",
-        "machine": u.machine, "python": sys.version.split()[0],
-        "script": {"name": "metadata_collector.py",
-                   "sha256": hashes_of_file(Path(__file__))["sha256"],
-                   "keep_raw": KEEP_RAW},
-        "tool_versions": versions}
-
+    s.doc["workstation"] = {**workstation_info(), "tool_versions": versions}
+    s.doc["workstation"]["script"]["keep_raw"] = KEEP_RAW
 
     print("[*] Verifying write protection (read-only)...")
     if not verify_read_only(s):
@@ -763,7 +748,6 @@ def collect(device, case_dir, evidence_id, examiner):
         sz = read_int(sysfs_path(path) / "size")
         try:
             dh = hash_device(path, sz * 512 if sz else None)
-            dh["path"] = path
             s.doc["device_hashes"][label] = dh
             if dh["complete"] is False:
                 s.warn(f"device hash {path} incomplete: {dh['bytes_hashed']} of "
@@ -890,111 +874,25 @@ def collect(device, case_dir, evidence_id, examiner):
 
 
     path, hpath, fh = s.finish("COMPLETED")
-    print("\n[+] DONE")
-    print(f"    YAML  : {path}")
-    print(f"    Hashes: {hpath}")
-    for a in HASH_ALGOS:
-        print(f"    {a.upper():<7}: {fh[a]}")
-
-
-
-def _walk_blobs(node, path=""):
-    if isinstance(node, dict):
-        if "hashes" in node and ("lines" in node or "data" in node or "base64" in node):
-            yield path, node
-        for k, v in node.items():
-            yield from _walk_blobs(v, f"{path}.{k}" if path else str(k))
-    elif isinstance(node, list):
-        for i, v in enumerate(node):
-            yield from _walk_blobs(v, f"{path}[{i}]")
-
-
-
-def load_report(path: Path):
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
-
-
-
-def verify(report_path: Path) -> int:
-    ok = True
-    raw = hashes_of_file(report_path)
-    hp = report_path.with_name(report_path.name + ".hashes.txt")
-    if hp.exists():
-        for line in hp.read_text(encoding="utf-8").splitlines():
-            m = re.match(r"(\w+) \((.+)\) = ([0-9a-f]+)", line)
-            if m:
-                a = m.group(1).lower()
-                good = raw.get(a) == m.group(3)
-                ok &= good
-                print(f"[{'OK' if good else 'FAIL'}] file {a}")
-    else:
-        print("[!] .hashes.txt file is missing")
-        ok = False
-    try:
-        doc = load_report(report_path)
-    except yaml.YAMLError as exc:
-        print(f"[FAIL] file is not valid YAML: {exc}")
-        return 1
-    n_bad = n = 0
-    for p, b in _walk_blobs(doc):
-        if "base64" in b:
-            data = base64.b64decode(b["base64"])
-        elif b.get("truncated"):
-            continue
-        else:
-            data = decode_text(b)
-        n += 1
-        if hashes_of(data) != b["hashes"]:
-            n_bad += 1
-            print(f"[FAIL] {p}")
-    print(f"[{'OK' if n_bad == 0 else 'FAIL'}] internal hashes (sectors, raw text): {n - n_bad}/{n} match")
-    ok &= n_bad == 0
-    print("RESULT:", "INTEGRITY CONFIRMED" if ok else "VIOLATED!")
-    return 0 if ok else 1
-
-
-
-def show(report_path: Path, art_id=None) -> int:
-    doc = load_report(report_path)
-    arts = doc.get("artifacts", {})
-    if not art_id:
-        for k, v in arts.items():
-            print(f"{k:<20} rc={v.get('returncode')}  {v.get('title')}")
-        return 0
-    if art_id not in arts:
-        print(f"no such artifact: {art_id}")
-        return 1
-    print(dump_yaml(arts[art_id].get("parsed", arts[art_id])), end="")
-    return 0
-
+    print_summary("COMPLETED", {"YAML": path, "Hashes": hpath}, fh)
 
 
 def main():
     global KEEP_RAW
     ap = argparse.ArgumentParser(description="Passive acquisition of media metadata -> a single YAML + hashes.")
-    ap.add_argument("device", nargs="?")
-    ap.add_argument("--case-dir")
-    ap.add_argument("--evidence-id")
-    ap.add_argument("--examiner")
+    ap.add_argument("--device", required=True, help="block device, e.g. /dev/sdb")
+    ap.add_argument("--case-dir", required=True, help="case directory (NOT on the examined media)")
+    ap.add_argument("--evidence-id", required=True)
+    ap.add_argument("--examiner", required=True)
     ap.add_argument("--keep-raw", action="store_true",
                     help="additionally save the raw stdout of commands (default: parsed fields only)")
-    ap.add_argument("--verify", metavar="FILE.yaml")
-    ap.add_argument("--show", nargs="+", metavar=("FILE.yaml", "ARTIFACT"))
     a = ap.parse_args()
-    if a.verify:
-        sys.exit(verify(Path(a.verify)))
-    if a.show:
-        sys.exit(show(Path(a.show[0]), a.show[1] if len(a.show) > 1 else None))
-    if not (a.device and a.case_dir and a.evidence_id and a.examiner):
-        ap.error("required: device, --case-dir, --evidence-id, --examiner")
-    if os.geteuid() != 0:
-        sys.exit("[!] Root privileges required (sudo).")
+    require_root()
     KEEP_RAW = a.keep_raw
     dev = a.device if a.device.startswith("/dev/") else "/dev/" + a.device
     if not Path(dev).exists():
         sys.exit(f"[!] Device {dev} does not exist (check lsblk).")
     collect(dev, Path(a.case_dir), a.evidence_id, a.examiner)
-
 
 
 if __name__ == "__main__":
